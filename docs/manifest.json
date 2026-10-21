@@ -1,0 +1,12 @@
+{
+  "name": "Lectly 강의 요약",
+  "short_name": "Lectly",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f7f7f5",
+  "theme_color": "#0f766e",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

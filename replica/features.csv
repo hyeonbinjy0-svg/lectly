@@ -1,0 +1,18 @@
+feature,area,priority,original,clone,notes
+Record audio in the app,record,must,yes,yes,
+Transcribe speech to text,ai,must,yes,yes,
+AI summary with key points,ai,must,yes,yes,
+List of saved notes,notes,must,yes,yes,
+Folders (subjects) for notes,notes,must,yes,yes,
+Search across transcripts,notes,must,yes,yes,
+Chat with your notes,ai,should,yes,yes,
+Import an existing audio file,record,should,yes,yes,
+Share / copy transcript and summary,notes,should,yes,yes,
+Speaker detection and labels,ai,could,yes,skip,lectures are mostly one speaker
+Zoom / Meet / Teams integration,integrations,could,yes,skip,not needed for in-person lectures
+Team sharing,sharing,could,yes,skip,personal use
+Subscription billing,billing,could,yes,skip,free personal app
+Edit the transcript,notes,should,no,yes,added: fixes review complaint about inaccurate transcripts
+Notes while recording,record,should,no,yes,added: review request
+Crash-safe recording with recovery,record,must,no,yes,added: fixes review complaint about lost lectures
+Retry failed processing,ai,must,no,yes,added: fixes stuck processing complaint

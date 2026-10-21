@@ -71,22 +71,23 @@ function geminiMime(type) {
 }
 
 function friendlyError(e) {
-  const msg = String(e?.message || e);
+  const google = String(e?.body || '').match(/"message":\s*"([^"]+)"/)?.[1];
+  const msg = google || String(e?.message || e);
   const status = e?.status || Number((msg.match(/\b(4\d\d|5\d\d)\b/) || [])[1]);
   if (status === 429) return '무료 사용량 한도에 걸렸어요. 1~2분 뒤 다시 시도하세요.';
   if (status === 400 && /api key/i.test(msg)) return 'API 키가 올바르지 않아요. 설정에서 다시 입력하세요.';
   if (status === 401 || status === 403) return 'API 키가 올바르지 않아요. 설정에서 다시 입력하세요.';
   if (status >= 500) return 'Google 서버가 잠시 응답하지 않아요. 잠시 뒤 다시 시도하세요.';
-  if (/fetch|network/i.test(msg)) return '인터넷 연결을 확인하세요.';
-  return msg;
+  if (/fetch|network|load failed/i.test(msg)) return '인터넷 연결을 확인하세요.';
+  return status ? `AI 요청이 실패했어요 (${status}): ${msg}` : msg;
 }
 
 // ---------- AI ----------
-const TRANSCRIBE_PROMPT = `이 대학 강의 녹음을 빠짐없이 받아쓰기 해줘.
+const TRANSCRIBE_PROMPT = `강의 녹음 전체를 빠짐없이 받아쓰기.
 - 요약하지 말고 들리는 말을 그대로 적어. 강의에서 쓴 언어 그대로 적어.
 - "어", "음" 같은 군말과 말 더듬기는 빼.
 - 주제가 바뀌면 빈 줄로 문단을 나눠.
-- 받아쓴 전문만 출력해.`;
+- 전문에는 받아쓴 내용만 적어.`;
 
 const SUMMARY_PROMPT = `아래는 대학 강의 전문과 학생이 강의 중에 쓴 메모야. 시험 공부용 요약 노트를 한국어 마크다운으로 만들어줘.
 형식:
@@ -104,6 +105,27 @@ const SUMMARY_PROMPT = `아래는 대학 강의 전문과 학생이 강의 중�
 규칙: 전문에 없는 내용은 지어내지 마. 해당 내용이 없는 섹션은 통째로 빼.`;
 
 const processing = new Set();
+const SPLIT = '=====전문=====';
+const INLINE_LIMIT = 14 * 1024 * 1024; // keeps the base64 request under Gemini's 20 MB inline limit
+const withTimeout = (p, min, what) => Promise.race([p, new Promise((_, reject) =>
+  setTimeout(() => reject(new Error(`${what}이(가) ${min}분 넘게 응답이 없어요. "다시 시도"를 눌러주세요.`)), min * 60000))]);
+const toBase64 = blob => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve(String(r.result).split(',')[1]);
+  r.onerror = () => reject(r.error);
+  r.readAsDataURL(blob);
+});
+
+async function audioPart(ai, n, mime) {
+  if (n.audio.size <= INLINE_LIMIT) return { type: 'audio', data: await toBase64(n.audio), mime_type: mime };
+  let file = await withTimeout(ai.files.upload({ file: n.audio, config: { mimeType: mime, displayName: n.title } }), 5, '오디오 업로드');
+  while (file.state === 'PROCESSING') {
+    await sleep(3000);
+    file = await ai.files.get({ name: file.name });
+  }
+  if (file.state === 'FAILED') throw new Error('Google에서 오디오를 처리하지 못했어요. 파일이 손상됐을 수 있어요.');
+  return { type: 'audio', uri: file.uri, mime_type: mime };
+}
 
 function processNote(id) {
   if (processing.has(id)) return;
@@ -125,30 +147,30 @@ async function runProcess(id) {
   try {
     const ai = new GoogleGenAI({ apiKey: key });
     if (!n.transcript) {
-      await step('오디오 올리는 중');
-      const mime = geminiMime(n.audioMime);
-      let file = await ai.files.upload({ file: n.audio, config: { mimeType: mime, displayName: n.title } });
-      while (file.state === 'PROCESSING') {
-        await sleep(3000);
-        file = await ai.files.get({ name: file.name });
-      }
-      if (file.state === 'FAILED') throw new Error('Google에서 오디오를 처리하지 못했어요. 파일이 손상됐을 수 있어요.');
-      await step('받아쓰는 중 (강의 길이에 따라 몇 분 걸려요)');
-      const r = await ai.interactions.create({
+      await step(n.audio.size > INLINE_LIMIT ? '긴 녹음이라 먼저 올리는 중' : '받아쓰고 요약하는 중 (1시간 강의 기준 2~4분)');
+      const audio = await audioPart(ai, n, geminiMime(n.audioMime));
+      if (n.audio.size > INLINE_LIMIT) await step('받아쓰고 요약하는 중 (1시간 강의 기준 2~4분)');
+      const r = await withTimeout(ai.interactions.create({
         model: MODEL,
-        input: [{ type: 'text', text: TRANSCRIBE_PROMPT }, { type: 'audio', uri: file.uri, mime_type: mime }],
-      });
-      n.transcript = (r.output_text || '').trim();
-      ai.files.delete({ name: file.name }).catch(() => {});
-      if (!n.transcript) throw new Error('받아쓰기 결과가 비어 있어요. 녹음에 말소리가 있는지 확인하세요.');
-      await putNote(n);
+        input: [
+          { type: 'text', text: `${SUMMARY_PROMPT}\n\n요약을 다 쓴 다음 줄에 정확히 ${SPLIT} 를 쓰고, 그 아래에 아래 규칙으로 강의 전문을 적어.\n${TRANSCRIBE_PROMPT}\n\n[학생 메모]\n${n.memo || '(없음)'}` },
+          audio,
+        ],
+      }), 15, 'AI');
+      const out = (r.output_text || '').trim();
+      if (!out) throw new Error('결과가 비어 있어요. 녹음에 말소리가 있는지 확인하세요.');
+      const i = out.indexOf(SPLIT);
+      n.summary = (i < 0 ? out : out.slice(0, i)).trim();
+      n.transcript = i < 0 ? '' : out.slice(i + SPLIT.length).trim();
+      if (audio.uri) ai.files.delete({ name: audio.uri.split('/').slice(-2).join('/') }).catch(() => {});
+    } else {
+      await step('요약하는 중');
+      const r = await withTimeout(ai.interactions.create({
+        model: MODEL,
+        input: `${SUMMARY_PROMPT}\n\n[학생 메모]\n${n.memo || '(없음)'}\n\n[강의 전문]\n${n.transcript}`,
+      }), 5, 'AI');
+      n.summary = (r.output_text || '').trim();
     }
-    await step('요약하는 중');
-    const r = await ai.interactions.create({
-      model: MODEL,
-      input: `${SUMMARY_PROMPT}\n\n[학생 메모]\n${n.memo || '(없음)'}\n\n[강의 전문]\n${n.transcript}`,
-    });
-    n.summary = (r.output_text || '').trim();
     const heading = n.summary.match(/^#\s+(.+)$/m);
     if (heading && n.autoTitle) n.title = heading[1].trim();
     Object.assign(n, { status: 'done', step: '', error: '' });
@@ -191,7 +213,7 @@ async function startRecording(subject) {
     return false;
   }
   const mime = pickMime();
-  const recorder = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 64000 } : undefined);
+  const recorder = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 24000 } : undefined);
   const id = crypto.randomUUID();
   await putNote({
     id, title: defaultTitle(), autoTitle: true, subject, createdAt: Date.now(), durationSec: 0,

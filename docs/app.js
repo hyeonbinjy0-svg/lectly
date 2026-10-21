@@ -5,6 +5,7 @@ import DOMPurify from 'https://cdn.jsdelivr.net/npm/dompurify@3.2.4/+esm';
 const MODEL = 'gemini-3.8-flash';
 const KEY_STORAGE = 'lectly.apiKey';
 const view = document.getElementById('view');
+const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 // ---------- storage (IndexedDB, on this device only) ----------
@@ -27,13 +28,19 @@ function tx(store, mode, fn) {
   }));
 }
 const getNote = id => tx('notes', 'readonly', s => s.get(id));
-const putNote = n => tx('notes', 'readwrite', s => s.put(n));
+const tabs = new BroadcastChannel('lectly');
+const putNote = n => tx('notes', 'readwrite', s => s.put(n)).then(() => tabs.postMessage(n.id));
 const deleteNote = id => tx('notes', 'readwrite', s => s.delete(id));
 const allNotes = () => tx('notes', 'readonly', s => s.getAll());
 const chunkRange = rec => IDBKeyRange.bound([rec, 0], [rec, Infinity]);
 const putChunk = (rec, seq, blob) => tx('chunks', 'readwrite', s => s.put({ rec, seq, blob }));
 const getChunks = rec => tx('chunks', 'readonly', s => s.getAll(chunkRange(rec)));
 const deleteChunks = rec => tx('chunks', 'readwrite', s => s.delete(chunkRange(rec)));
+
+const lockName = id => 'lectly-' + id;
+async function busyIds() {
+  try { return new Set((await navigator.locks.query()).held.map(l => l.name)); } catch { return new Set(); }
+}
 
 // ---------- helpers ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -98,16 +105,22 @@ const SUMMARY_PROMPT = `아래는 대학 강의 전문과 학생이 강의 중�
 
 const processing = new Set();
 
-async function processNote(id) {
+function processNote(id) {
   if (processing.has(id)) return;
+  processing.add(id);
+  onNoteChanged(id);
+  return navigator.locks.request(lockName(id), () => runProcess(id)).finally(() => processing.delete(id));
+}
+
+async function runProcess(id) {
   const key = getKey();
   let n = await getNote(id);
+  if (!n || n.status === 'done') return;
   if (!key) {
     Object.assign(n, { status: 'error', error: '설정(⚙︎)에서 Gemini API 키를 먼저 입력하세요.' });
     await putNote(n);
     return onNoteChanged(id);
   }
-  processing.add(id);
   const step = async label => { n.status = 'processing'; n.step = label; n.error = ''; await putNote(n); onNoteChanged(id); };
   try {
     const ai = new GoogleGenAI({ apiKey: key });
@@ -143,7 +156,6 @@ async function processNote(id) {
     console.error(e);
     Object.assign(n, { status: 'error', step: '', error: friendlyError(e) });
   } finally {
-    processing.delete(id);
     await putNote(n);
     onNoteChanged(id);
   }
@@ -162,7 +174,8 @@ async function askNote(n, question) {
 let rec = null;
 
 function pickMime() {
-  return ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+  const order = IS_SAFARI ? ['audio/mp4', 'audio/webm;codecs=opus'] : ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'];
+  return order.find(t => MediaRecorder.isTypeSupported(t)) || '';
 }
 
 async function keepAwake() {
@@ -187,6 +200,7 @@ async function startRecording(subject) {
   let seq = 0;
   const pending = [];
   rec = { id, recorder, stream, pending, startedAt: Date.now(), elapsed: 0, paused: false };
+  navigator.locks.request(lockName(id), () => new Promise(release => { rec.unlock = release; }));
   recorder.ondataavailable = e => { if (e.data.size) pending.push(putChunk(id, seq++, e.data)); };
   recorder.onstop = () => finishRecording();
   stream.getAudioTracks()[0].onended = () => {
@@ -221,16 +235,23 @@ async function finishRecording() {
   stream.getTracks().forEach(t => t.stop());
   wakeLock?.release().catch(() => {});
   await Promise.all(pending);
+  await sleep(500); // some browsers deliver the last chunk after 'stop'
+  await Promise.all(pending);
   const n = await getNote(id);
   const memo = document.getElementById('memo');
   if (memo) n.memo = memo.value;
   n.durationSec = durationSec;
   n.audio = await assemble(id, n.audioMime);
-  n.status = 'processing';
+  const empty = !n.audio.size;
+  Object.assign(n, empty
+    ? { status: 'error', error: '녹음된 소리가 없어요. 마이크 권한과 입력 장치를 확인하세요.' }
+    : { status: 'processing', step: '', error: '' });
   await putNote(n);
   await deleteChunks(id);
+  rec.unlock?.();
   rec = null;
   location.hash = '#/note/' + id;
+  if (empty) return;
   if (interrupted) toast('마이크가 끊겨 녹음이 멈췄어요. 그 전까지 녹음된 부분을 요약해요.');
   processNote(id);
 }
@@ -242,7 +263,9 @@ async function assemble(id, mime) {
 
 // a recording or processing run interrupted by a crash, reload or iOS killing the tab
 async function recoverInterrupted() {
+  const busy = await busyIds();
   for (const n of await allNotes()) {
+    if (busy.has(lockName(n.id))) continue;
     if (n.status === 'processing') {
       Object.assign(n, { status: 'error', step: '', error: '처리 도중 앱이 닫혔어요. 녹음은 그대로 있으니 "다시 시도"를 누르세요.' });
       await putNote(n);
@@ -400,6 +423,7 @@ async function renderRecord() {
 
 async function renderNote(id) {
   const n = await getNote(id);
+  const stuck = n && n.status === 'processing' && !processing.has(id) && !(await busyIds()).has(lockName(id));
   if (!n) { view.innerHTML = '<div class="empty">노트를 찾을 수 없어요. <a href="#/">목록으로</a></div>'; return; }
   const audioUrl = n.audio ? URL.createObjectURL(n.audio) : '';
   const chat = chats.get(id) || [];
@@ -423,7 +447,8 @@ async function renderNote(id) {
       <input type="text" id="title" value="${esc(n.title)}" aria-label="제목" style="font-size:20px;font-weight:700">
       <input type="text" id="subj" value="${esc(n.subject)}" placeholder="과목" aria-label="과목">
       <p class="muted">${fmtDate(n.createdAt)}${n.durationSec ? ' · ' + fmtTime(n.durationSec) : ''}</p>
-      ${n.status === 'processing' ? `<p class="notice">⏳ ${esc(n.step || '준비 중')}… 화면을 나가도 되지만, Lectly는 닫지 마세요.</p>` : ''}
+      ${n.status === 'processing' && !stuck ? `<p class="notice">⏳ ${esc(n.step || '준비 중')}… 화면을 나가도 되지만, Lectly는 닫지 마세요.</p>` : ''}
+      ${stuck ? `<div class="notice error">처리가 멈췄어요. 녹음은 그대로 있어요.<div style="margin-top:8px"><button id="retry">다시 시도</button></div></div>` : ''}
       ${n.status === 'error' ? `<div class="notice error">${esc(n.error)}<div style="margin-top:8px"><button id="retry">다시 시도</button></div></div>` : ''}
       ${audioUrl ? `<audio controls src="${audioUrl}"></audio>` : ''}
       ${n.memo ? `<details><summary class="muted">내 메모</summary><p class="transcript">${esc(n.memo)}</p></details>` : ''}
@@ -522,6 +547,7 @@ function onNoteChanged(id) {
   else if (h === '#/' && renderList.fill) renderList();
 }
 
+tabs.onmessage = e => onNoteChanged(e.data);
 window.addEventListener('hashchange', () => { if (!location.hash.startsWith('#/note/')) noteTab = 'summary'; route(); });
 await recoverInterrupted();
 route();

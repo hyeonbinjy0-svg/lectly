@@ -46,6 +46,8 @@ async function busyIds() {
 // ---------- helpers ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const md = s => DOMPurify.sanitize(marked.parse(s || ''));
+// audio is stored as an ArrayBuffer: Safari breaks Blobs in IndexedDB once their record is re-saved
+const audioOf = n => new Blob([n.audio], { type: n.audioMime });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const getKey = () => localStorage.getItem(KEY_STORAGE) || '';
 const fmtTime = sec => {
@@ -127,8 +129,9 @@ async function generate(ai, input, min) {
 }
 
 async function audioPart(ai, n, mime) {
-  if (n.audio.size <= INLINE_LIMIT) return { type: 'audio', data: await toBase64(n.audio), mime_type: mime };
-  let file = await withTimeout(ai.files.upload({ file: n.audio, config: { mimeType: mime, displayName: n.title } }), 5, '오디오 업로드');
+  const blob = audioOf(n);
+  if (blob.size <= INLINE_LIMIT) return { type: 'audio', data: await toBase64(blob), mime_type: mime };
+  let file = await withTimeout(ai.files.upload({ file: blob, config: { mimeType: mime, displayName: n.title } }), 5, '오디오 업로드');
   while (file.state === 'PROCESSING') {
     await sleep(3000);
     file = await ai.files.get({ name: file.name });
@@ -157,9 +160,10 @@ async function runProcess(id) {
   try {
     const ai = new GoogleGenAI({ apiKey: key });
     if (!n.transcript) {
-      await step(n.audio.size > INLINE_LIMIT ? '긴 녹음이라 먼저 올리는 중' : '받아쓰고 요약하는 중 (1시간 강의 기준 2~4분)');
+      const big = audioOf(n).size > INLINE_LIMIT;
+      await step(big ? '긴 녹음이라 먼저 올리는 중' : '받아쓰고 요약하는 중 (1시간 강의 기준 2~4분)');
       const audio = await audioPart(ai, n, geminiMime(n.audioMime));
-      if (n.audio.size > INLINE_LIMIT) await step('받아쓰고 요약하는 중 (1시간 강의 기준 2~4분)');
+      if (big) await step('받아쓰고 요약하는 중 (1시간 강의 기준 2~4분)');
       const out = await generate(ai, [
           { type: 'text', text: `${SUMMARY_PROMPT}\n\n요약을 다 쓴 다음 줄에 정확히 ${SPLIT} 를 쓰고, 그 아래에 아래 규칙으로 강의 전문을 적어.\n${TRANSCRIBE_PROMPT}\n\n[학생 메모]\n${n.memo || '(없음)'}` },
           audio,
@@ -221,7 +225,11 @@ async function startRecording(subject) {
   const pending = [];
   rec = { id, recorder, stream, pending, startedAt: Date.now(), elapsed: 0, paused: false };
   navigator.locks.request(lockName(id), () => new Promise(release => { rec.unlock = release; }));
-  recorder.ondataavailable = e => { if (e.data.size) pending.push(putChunk(id, seq++, e.data)); };
+  recorder.ondataavailable = e => {
+    if (!e.data.size) return;
+    const s = seq++;
+    pending.push(e.data.arrayBuffer().then(buf => putChunk(id, s, buf)));
+  };
   recorder.onstop = () => finishRecording();
   stream.getAudioTracks()[0].onended = () => {
     if (rec && rec.recorder.state !== 'inactive') { rec.interrupted = true; rec.recorder.stop(); }
@@ -262,7 +270,7 @@ async function finishRecording() {
   if (memo) n.memo = memo.value;
   n.durationSec = durationSec;
   n.audio = await assemble(id, n.audioMime);
-  const empty = !n.audio.size;
+  const empty = !n.audio.byteLength;
   Object.assign(n, empty
     ? { status: 'error', error: '녹음된 소리가 없어요. 마이크 권한과 입력 장치를 확인하세요.' }
     : { status: 'processing', step: '', error: '' });
@@ -278,7 +286,7 @@ async function finishRecording() {
 
 async function assemble(id, mime) {
   const chunks = (await getChunks(id)).sort((a, b) => a.seq - b.seq).map(c => c.blob);
-  return new Blob(chunks, { type: mime });
+  return new Blob(chunks, { type: mime }).arrayBuffer();
 }
 
 // a recording or processing run interrupted by a crash, reload or iOS killing the tab
@@ -293,7 +301,7 @@ async function recoverInterrupted() {
     }
     if (n.status !== 'recording' || n.id === rec?.id) continue;
     n.audio = await assemble(n.id, n.audioMime);
-    if (!n.audio.size) { await deleteNote(n.id); await deleteChunks(n.id); continue; }
+    if (!n.audio.byteLength) { await deleteNote(n.id); await deleteChunks(n.id); continue; }
     Object.assign(n, { status: 'error', error: '녹음이 중간에 끊겼어요. 저장된 부분까지는 남아 있어요. "다시 시도"를 누르면 요약해요.' });
     await putNote(n);
     await deleteChunks(n.id);
@@ -382,7 +390,7 @@ async function renderList() {
     const id = crypto.randomUUID();
     await putNote({
       id, title: f.name.replace(/\.[^.]+$/, ''), autoTitle: true, subject: listFilter.subject, createdAt: Date.now(), durationSec: 0,
-      audio: f, audioMime: f.type || 'audio/m4a', memo: '', transcript: '', summary: '', status: 'processing', step: '', error: '',
+      audio: await f.arrayBuffer(), audioMime: f.type || 'audio/m4a', memo: '', transcript: '', summary: '', status: 'processing', step: '', error: '',
     });
     location.hash = '#/note/' + id;
     processNote(id);
@@ -445,7 +453,7 @@ async function renderNote(id) {
   const n = await getNote(id);
   const stuck = n && n.status === 'processing' && !processing.has(id) && !(await busyIds()).has(lockName(id));
   if (!n) { view.innerHTML = '<div class="empty">노트를 찾을 수 없어요. <a href="#/">목록으로</a></div>'; return; }
-  const audioUrl = n.audio ? URL.createObjectURL(n.audio) : '';
+  const audioUrl = n.audio ? URL.createObjectURL(audioOf(n)) : '';
   const chat = chats.get(id) || [];
   const body = {
     summary: n.summary ? `<div class="md">${md(n.summary)}</div>` : '<p class="muted">요약이 아직 없어요.</p>',

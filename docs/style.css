@@ -110,3 +110,9 @@ audio { width: 100%; }
 }
 .recbar[hidden] { display: none; }
 details.notice summary { cursor: pointer; }
+
+.transcript-view p { margin: 0 0 14px; line-height: 1.7; }
+.ts {
+  font: 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 3px 6px; margin-right: 4px;
+  border-radius: 6px; background: var(--brand-soft); color: var(--brand); border-color: transparent;
+}

@@ -90,6 +90,7 @@ const TRANSCRIBE_PROMPT = `강의 녹음 전체를 빠짐없이 받아쓰기.
 - 요약하지 말고 들리는 말을 그대로 적어. 강의에서 쓴 언어 그대로 적어.
 - "어", "음" 같은 군말과 말 더듬기는 빼.
 - 주제가 바뀌면 빈 줄로 문단을 나눠.
+- 각 문단 맨 앞에 그 문단이 녹음에서 시작되는 시각을 [분:초] 형식으로 붙여 (예: [03:12], 1시간이 넘으면 [1:03:12]).
 - 전문에는 받아쓴 내용만 적어.`;
 
 const SUMMARY_PROMPT = `아래는 대학 강의 전문과 학생이 강의 중에 쓴 메모야. 시험 공부용 요약 노트를 한국어 마크다운으로 만들어줘.
@@ -172,6 +173,10 @@ async function runProcess(id) {
       const i = out.indexOf(SPLIT);
       n.summary = (i < 0 ? out : out.slice(0, i)).trim();
       n.transcript = i < 0 ? '' : out.slice(i + SPLIT.length).trim();
+      if (!n.transcript) {
+        await step('원문 받아쓰는 중');
+        n.transcript = await generate(ai, [{ type: 'text', text: TRANSCRIBE_PROMPT }, audio], 8);
+      }
       if (audio.uri) ai.files.delete({ name: audio.uri.split('/').slice(-2).join('/') }).catch(() => {});
     } else {
       await step('요약하는 중');
@@ -330,6 +335,17 @@ window.addEventListener('beforeunload', e => { if (rec) e.preventDefault(); });
 // ---------- screens ----------
 let listFilter = { subject: '', q: '' };
 let noteTab = 'summary';
+let editingTranscript = false;
+
+const TS = /^\[((?:\d+:)?\d{1,2}:\d{2})\]\s*/;
+function transcriptHtml(text) {
+  return text.split(/\n\s*\n/).map(p => {
+    const m = p.match(TS);
+    if (!m) return `<p>${esc(p)}</p>`;
+    const sec = m[1].split(':').reduce((acc, v) => acc * 60 + Number(v), 0);
+    return `<p><button class="ts" data-t="${sec}">${m[1]}</button> ${esc(p.slice(m[0].length))}</p>`;
+  }).join('');
+}
 const chats = new Map();
 
 async function renderList() {
@@ -458,18 +474,27 @@ async function renderNote(id) {
   const chat = chats.get(id) || [];
   const body = {
     summary: n.summary ? `<div class="md">${md(n.summary)}</div>` : '<p class="muted">요약이 아직 없어요.</p>',
-    transcript: n.transcript ? `
+    memo: `
+      <textarea id="memoEdit" placeholder="강의에 대한 내 메모">${esc(n.memo)}</textarea>
+      <div class="row" style="margin-top:8px"><button id="saveMemo">메모 저장</button></div>`,
+    transcript: !n.transcript ? '<p class="muted">원문이 아직 없어요.</p>' : editingTranscript ? `
       <textarea id="transcript" style="min-height:50vh">${esc(n.transcript)}</textarea>
       <div class="row" style="margin-top:8px">
-        <button id="saveT">전문 저장</button>
-        <button id="resummarize">이 전문으로 요약 다시 만들기</button>
-      </div>` : '<p class="muted">전문이 아직 없어요.</p>',
+        <button id="saveT">원문 저장</button>
+        <button id="resummarize">이 원문으로 요약 다시 만들기</button>
+        <button id="cancelT">취소</button>
+      </div>` : `
+      <div class="row" style="justify-content:space-between">
+        <span class="muted">시간을 누르면 그 부분부터 재생돼요</span>
+        <button id="editT">편집</button>
+      </div>
+      <div class="transcript-view">${transcriptHtml(n.transcript)}</div>`,
     ask: n.transcript ? `
       <div class="chat">${chat.map(c => `<p class="q">Q. ${esc(c.q)}</p><div class="md">${md(c.a)}</div>`).join('')}</div>
       <form id="askForm" class="row" style="margin-top:12px">
         <input type="text" id="question" placeholder="예: 수요의 가격탄력성이 뭐였지?" style="flex:1">
         <button class="primary">질문</button>
-      </form>` : '<p class="muted">전문이 생기면 질문할 수 있어요.</p>',
+      </form>` : '<p class="muted">원문이 생기면 질문할 수 있어요.</p>',
   }[noteTab];
   view.innerHTML = `
     <div class="stack">
@@ -480,31 +505,46 @@ async function renderNote(id) {
       ${stuck ? `<div class="notice error">처리가 멈췄어요. 녹음은 그대로 있어요.<div style="margin-top:8px"><button id="retry">다시 시도</button></div></div>` : ''}
       ${n.status === 'error' ? `<div class="notice error">${esc(n.error)}<div style="margin-top:8px"><button id="retry">다시 시도</button></div></div>` : ''}
       ${audioUrl ? `<audio controls src="${audioUrl}"></audio>` : ''}
-      ${n.memo ? `<details><summary class="muted">내 메모</summary><p class="transcript">${esc(n.memo)}</p></details>` : ''}
     </div>
     <div class="tabs">
       <button data-tab="summary" class="${noteTab === 'summary' ? 'on' : ''}">요약</button>
-      <button data-tab="transcript" class="${noteTab === 'transcript' ? 'on' : ''}">전문</button>
+      <button data-tab="memo" class="${noteTab === 'memo' ? 'on' : ''}">내 메모</button>
+      <button data-tab="transcript" class="${noteTab === 'transcript' ? 'on' : ''}">원문</button>
       <button data-tab="ask" class="${noteTab === 'ask' ? 'on' : ''}">질문하기</button>
     </div>
     ${body}
     <div class="row" style="margin-top:24px;justify-content:space-between">
-      <button id="copy" ${n.summary || n.transcript ? '' : 'disabled'}>요약+전문 복사</button>
+      <button id="copy" ${n.summary || n.transcript ? '' : 'disabled'}>요약+원문 복사</button>
       <button class="danger" id="del">삭제</button>
     </div>`;
 
   const save = async patch => { const cur = await getNote(id); Object.assign(cur, patch); await putNote(cur); };
   document.getElementById('title').onchange = e => save({ title: e.target.value.trim() || n.title, autoTitle: false });
   document.getElementById('subj').onchange = e => save({ subject: e.target.value.trim() });
-  view.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { noteTab = b.dataset.tab; renderNote(id); });
+  view.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { noteTab = b.dataset.tab; editingTranscript = false; renderNote(id); });
+  view.querySelectorAll('.ts').forEach(b => b.onclick = () => {
+    const a = view.querySelector('audio');
+    if (!a) return;
+    a.currentTime = Number(b.dataset.t);
+    a.play();
+  });
+  document.getElementById('editT')?.addEventListener('click', () => { editingTranscript = true; renderNote(id); });
+  document.getElementById('cancelT')?.addEventListener('click', () => { editingTranscript = false; renderNote(id); });
+  document.getElementById('saveMemo')?.addEventListener('click', async () => {
+    await save({ memo: document.getElementById('memoEdit').value });
+    toast('메모를 저장했어요');
+  });
   document.getElementById('retry')?.addEventListener('click', () => processNote(id));
   document.getElementById('saveT')?.addEventListener('click', async () => {
     await save({ transcript: document.getElementById('transcript').value });
-    toast('전문을 저장했어요');
+    editingTranscript = false;
+    toast('원문을 저장했어요');
+    renderNote(id);
   });
   document.getElementById('resummarize')?.addEventListener('click', async () => {
     await save({ transcript: document.getElementById('transcript').value });
     noteTab = 'summary';
+    editingTranscript = false;
     processNote(id);
   });
   document.getElementById('askForm')?.addEventListener('submit', async e => {
@@ -523,7 +563,7 @@ async function renderNote(id) {
     }
   });
   document.getElementById('copy').onclick = async () => {
-    await navigator.clipboard.writeText(`${n.summary || ''}\n\n---\n전문\n\n${n.transcript || ''}`);
+    await navigator.clipboard.writeText(`${n.summary || ''}\n\n---\n\n## 원문\n\n${n.transcript || ''}`);
     toast('복사했어요. 메모 앱이나 노션에 붙여넣으세요.');
   };
   document.getElementById('del').onclick = async () => {
@@ -577,6 +617,6 @@ function onNoteChanged(id) {
 }
 
 tabs.onmessage = e => onNoteChanged(e.data);
-window.addEventListener('hashchange', () => { if (!location.hash.startsWith('#/note/')) noteTab = 'summary'; route(); });
+window.addEventListener('hashchange', () => { if (!location.hash.startsWith('#/note/')) noteTab = 'summary'; editingTranscript = false; route(); });
 await recoverInterrupted();
 route();

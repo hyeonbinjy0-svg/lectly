@@ -573,6 +573,50 @@ async function renderNote(id) {
   };
 }
 
+// ---------- backup ----------
+function download(name, text, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+const today = () => new Date().toISOString().slice(0, 10);
+
+async function backupJson(withAudio) {
+  const notes = await Promise.all((await allNotes()).map(async n => ({
+    ...n, audio: withAudio && n.audio ? await toBase64(audioOf(n)) : undefined,
+  })));
+  return JSON.stringify({ app: 'lectly', version: 1, notes });
+}
+
+async function restoreJson(text) {
+  const data = JSON.parse(text);
+  if (data?.app !== 'lectly' || !Array.isArray(data.notes)) throw new Error('Lectly 백업 파일이 아니에요.');
+  let count = 0;
+  for (const n of data.notes) {
+    if (typeof n?.id !== 'string' || typeof n.title !== 'string' || typeof n.createdAt !== 'number') continue;
+    const cur = await getNote(n.id);
+    const audio = typeof n.audio === 'string'
+      ? await (await fetch('data:application/octet-stream;base64,' + n.audio)).arrayBuffer()
+      : cur?.audio;
+    await putNote({ ...cur, ...n, audio });
+    count++;
+  }
+  return count;
+}
+
+async function notionMarkdown() {
+  const notes = (await allNotes()).filter(n => n.summary || n.transcript).sort((a, b) => a.createdAt - b.createdAt);
+  return notes.map(n => [
+    `# ${n.title}`,
+    `${n.subject ? n.subject + ' · ' : ''}${fmtDate(n.createdAt)}`,
+    (n.summary || '').replace(/^#\s+.+\n?/, '').trim(),
+    n.memo ? `## 내 메모\n\n${n.memo}` : '',
+    n.transcript ? `## 원문\n\n${n.transcript}` : '',
+  ].filter(Boolean).join('\n\n')).join('\n\n---\n\n');
+}
+
 function renderSettings() {
   view.innerHTML = `
     <h1>설정</h1>
@@ -592,8 +636,31 @@ function renderSettings() {
         키는 이 기기에만 저장돼요. 결제 수단을 등록하지 않으면 요금이 나오지 않아요.
         단, 무료 등급으로 보낸 녹음은 Google이 서비스 개선에 쓸 수 있어요.
       </div>
-      <p class="muted">노트는 이 기기의 브라우저에만 저장돼요. Safari 방문 기록·웹사이트 데이터를 지우면 노트도 지워지니, 중요한 노트는 "복사"로 백업하세요.</p>
+      <h2>백업</h2>
+      <p class="muted">노트는 이 기기의 브라우저에만 저장돼요. 방문 기록·웹사이트 데이터를 지우면 사라지니 가끔 백업 파일을 저장해 두세요. 다른 기기로 옮길 때도 써요.</p>
+      <label class="row" style="color:var(--text)"><input type="checkbox" id="withAudio"> 녹음 파일도 포함 (파일이 커져요)</label>
+      <div class="row">
+        <button id="backup">백업 파일 저장</button>
+        <label class="btn">백업 불러오기<input type="file" id="restore" accept=".json,application/json" hidden></label>
+      </div>
+      <button id="notion">노션용 파일로 내보내기 (.md)</button>
+      <p class="muted">노션에서 가져오기 → 텍스트 및 마크다운을 고르고 이 파일을 선택하세요.</p>
     </div>`;
+  document.getElementById('backup').onclick = async e => {
+    e.target.disabled = true;
+    try { download(`lectly-backup-${today()}.json`, await backupJson(document.getElementById('withAudio').checked), 'application/json'); }
+    finally { e.target.disabled = false; }
+  };
+  document.getElementById('restore').onchange = async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try { toast(`노트 ${await restoreJson(await f.text())}개를 불러왔어요`); }
+    catch (err) { toast(err instanceof SyntaxError ? 'Lectly 백업 파일이 아니에요.' : err.message); }
+    e.target.value = '';
+  };
+  document.getElementById('notion').onclick = async () => {
+    download(`lectly-notes-${today()}.md`, await notionMarkdown(), 'text/markdown');
+  };
   document.getElementById('saveKey').onclick = () => {
     localStorage.setItem(KEY_STORAGE, document.getElementById('key').value.trim());
     toast('저장했어요');

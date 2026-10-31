@@ -2,7 +2,8 @@ import { GoogleGenAI } from 'https://esm.sh/@google/genai@2.24.0';
 import { marked } from 'https://cdn.jsdelivr.net/npm/marked@14.1.4/+esm';
 import DOMPurify from 'https://cdn.jsdelivr.net/npm/dompurify@3.2.4/+esm';
 
-const MODEL = 'gemini-3.8-flash';
+// fastest first; free-tier models are often slow or busy, so fall through to the next one
+const MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash'];
 const KEY_STORAGE = 'lectly.apiKey';
 const view = document.getElementById('view');
 const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
@@ -116,6 +117,15 @@ const toBase64 = blob => new Promise((resolve, reject) => {
   r.readAsDataURL(blob);
 });
 
+async function generate(ai, input, min) {
+  let last;
+  for (const model of MODELS) {
+    try { return ((await withTimeout(ai.interactions.create({ model, input }), min, 'AI')).output_text || '').trim(); }
+    catch (e) { last = e; if ([400, 401, 403].includes(e?.status)) throw e; }
+  }
+  throw last;
+}
+
 async function audioPart(ai, n, mime) {
   if (n.audio.size <= INLINE_LIMIT) return { type: 'audio', data: await toBase64(n.audio), mime_type: mime };
   let file = await withTimeout(ai.files.upload({ file: n.audio, config: { mimeType: mime, displayName: n.title } }), 5, '오디오 업로드');
@@ -150,14 +160,10 @@ async function runProcess(id) {
       await step(n.audio.size > INLINE_LIMIT ? '긴 녹음이라 먼저 올리는 중' : '받아쓰고 요약하는 중 (1시간 강의 기준 2~4분)');
       const audio = await audioPart(ai, n, geminiMime(n.audioMime));
       if (n.audio.size > INLINE_LIMIT) await step('받아쓰고 요약하는 중 (1시간 강의 기준 2~4분)');
-      const r = await withTimeout(ai.interactions.create({
-        model: MODEL,
-        input: [
+      const out = await generate(ai, [
           { type: 'text', text: `${SUMMARY_PROMPT}\n\n요약을 다 쓴 다음 줄에 정확히 ${SPLIT} 를 쓰고, 그 아래에 아래 규칙으로 강의 전문을 적어.\n${TRANSCRIBE_PROMPT}\n\n[학생 메모]\n${n.memo || '(없음)'}` },
           audio,
-        ],
-      }), 15, 'AI');
-      const out = (r.output_text || '').trim();
+        ], 8);
       if (!out) throw new Error('결과가 비어 있어요. 녹음에 말소리가 있는지 확인하세요.');
       const i = out.indexOf(SPLIT);
       n.summary = (i < 0 ? out : out.slice(0, i)).trim();
@@ -165,11 +171,7 @@ async function runProcess(id) {
       if (audio.uri) ai.files.delete({ name: audio.uri.split('/').slice(-2).join('/') }).catch(() => {});
     } else {
       await step('요약하는 중');
-      const r = await withTimeout(ai.interactions.create({
-        model: MODEL,
-        input: `${SUMMARY_PROMPT}\n\n[학생 메모]\n${n.memo || '(없음)'}\n\n[강의 전문]\n${n.transcript}`,
-      }), 5, 'AI');
-      n.summary = (r.output_text || '').trim();
+      n.summary = await generate(ai, `${SUMMARY_PROMPT}\n\n[학생 메모]\n${n.memo || '(없음)'}\n\n[강의 전문]\n${n.transcript}`, 3);
     }
     const heading = n.summary.match(/^#\s+(.+)$/m);
     if (heading && n.autoTitle) n.title = heading[1].trim();
@@ -185,11 +187,7 @@ async function runProcess(id) {
 
 async function askNote(n, question) {
   const ai = new GoogleGenAI({ apiKey: getKey() });
-  const r = await ai.interactions.create({
-    model: MODEL,
-    input: `아래 강의 전문만 근거로 한국어로 짧게 답해. 전문에 없는 내용이면 "강의에서 다루지 않았어요"라고 해.\n\n[강의 전문]\n${n.transcript}\n\n[질문]\n${question}`,
-  });
-  return (r.output_text || '').trim();
+  return generate(ai, `아래 강의 전문만 근거로 한국어로 짧게 답해. 전문에 없는 내용이면 "강의에서 다루지 않았어요"라고 해.\n\n[강의 전문]\n${n.transcript}\n\n[질문]\n${question}`, 2);
 }
 
 // ---------- recording ----------

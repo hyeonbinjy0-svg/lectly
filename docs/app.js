@@ -177,6 +177,7 @@ async function runProcess(id) {
       await step('요약하는 중');
       n.summary = await generate(ai, `${SUMMARY_PROMPT}\n\n[학생 메모]\n${n.memo || '(없음)'}\n\n[강의 전문]\n${n.transcript}`, 3);
     }
+    if (!n.summary) throw new Error('요약 결과가 비어 있어요. 녹음에 말소리가 있는지 확인하고 다시 시도하세요.');
     const heading = n.summary.match(/^#\s+(.+)$/m);
     if (heading && n.autoTitle) n.title = heading[1].trim();
     Object.assign(n, { status: 'done', step: '', error: '' });
